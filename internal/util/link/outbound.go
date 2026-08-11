@@ -342,7 +342,9 @@ func parseShadowsocks(link string) (*ParseResult, error) {
 		remark, _ = url.QueryUnescape(link[i+1:])
 		link = link[:i]
 	}
+	params := url.Values{}
 	if i := strings.Index(link, "?"); i >= 0 {
+		params, _ = url.ParseQuery(link[i+1:])
 		link = link[:i]
 	}
 	core := strings.TrimPrefix(link, "ss://")
@@ -371,9 +373,17 @@ func parseShadowsocks(link string) (*ParseResult, error) {
 		}
 		method, pass := splitMethodPass(userInfo)
 		identity := "ss:" + method + ":" + pass + "@" + host + ":" + strconv.Itoa(port)
+		applyShadowsocksPlugin(params)
+		network := supportedShadowsocksNetwork(params.Get("type"))
+		security := supportedShadowsocksSecurity(params.Get("security"))
+		stream := buildStream(network, security)
+		applyTransport(stream, params)
+		applySecurity(stream, params)
+		applyFinalMask(stream, params)
 		ob := Outbound{
-			"protocol": "shadowsocks",
-			"tag":      remark,
+			"protocol":       "shadowsocks",
+			"tag":            remark,
+			"streamSettings": stream,
 			"settings": map[string]any{
 				"servers": []any{
 					map[string]any{"address": host, "port": port, "password": pass, "method": method},
@@ -414,6 +424,43 @@ func parseShadowsocks(link string) (*ParseResult, error) {
 		},
 	}
 	return &ParseResult{Outbound: ob, Identity: identity}, nil
+}
+
+func applyShadowsocksPlugin(params url.Values) {
+	parts := strings.Split(params.Get("plugin"), ";")
+	if len(parts) == 0 || parts[0] != "obfs-local" {
+		return
+	}
+	options := map[string]string{}
+	for _, part := range parts[1:] {
+		if key, value, ok := strings.Cut(part, "="); ok {
+			options[key] = value
+		}
+	}
+	if options["obfs"] != "http" {
+		return
+	}
+	params.Set("type", "tcp")
+	params.Set("headerType", "http")
+	params.Set("host", options["obfs-host"])
+}
+
+func supportedShadowsocksNetwork(network string) string {
+	switch network {
+	case "tcp", "kcp", "ws", "grpc", "httpupgrade", "xhttp":
+		return network
+	default:
+		return "tcp"
+	}
+}
+
+func supportedShadowsocksSecurity(security string) string {
+	switch security {
+	case "tls", "reality":
+		return security
+	default:
+		return "none"
+	}
 }
 
 func splitMethodPass(userInfo string) (string, string) {
@@ -606,6 +653,14 @@ func applyTransport(stream map[string]any, p url.Values) {
 	host := p.Get("host")
 	path := firstNonEmpty(p.Get("path"), "/")
 	switch net {
+	case "kcp":
+		kcp := stream["kcpSettings"].(map[string]any)
+		if mtu, err := strconv.Atoi(p.Get("mtu")); err == nil && mtu > 0 {
+			kcp["mtu"] = mtu
+		}
+		if tti, err := strconv.Atoi(p.Get("tti")); err == nil && tti > 0 {
+			kcp["tti"] = tti
+		}
 	case "ws":
 		setWS(stream, host, path)
 	case "grpc":
@@ -664,6 +719,7 @@ func applySecurity(stream map[string]any, p url.Values) {
 			tls["alpn"] = splitComma(alpn)
 		}
 		tls["echConfigList"] = p.Get("ech")
+		tls["verifyPeerCertByName"] = p.Get("vcn")
 		tls["pinnedPeerCertSha256"] = p.Get("pcs")
 	case "reality":
 		re := stream["realitySettings"].(map[string]any)

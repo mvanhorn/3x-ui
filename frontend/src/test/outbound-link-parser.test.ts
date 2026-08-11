@@ -9,7 +9,10 @@ import {
   parseHysteria2Link,
   parseWireguardLink,
 } from '@/lib/xray/outbound-link-parser';
+import { genShadowsocksLink } from '@/lib/xray/inbound-link';
+import { InboundSchema } from '@/schemas/api/inbound';
 import { Base64 } from '@/utils';
+import shadowsocksFixture from './golden/fixtures/inbound-full/shadowsocks-tcp-2022.json';
 
 // Focused acceptance tests for the share-link parsers — one happy-path
 // case per protocol family, plus a few common edge cases. The parsers
@@ -213,6 +216,88 @@ describe('parseTrojanLink', () => {
 });
 
 describe('parseShadowsocksLink', () => {
+  it('round-trips transport and TLS settings emitted by genShadowsocksLink', () => {
+    const raw = structuredClone(shadowsocksFixture) as Record<string, unknown>;
+    const stream = raw.streamSettings as Record<string, unknown>;
+    stream.security = 'tls';
+    stream.tlsSettings = {
+      serverName: 'edge.example.com',
+      alpn: ['h2', 'http/1.1'],
+      settings: { fingerprint: 'chrome' },
+    };
+    const inbound = InboundSchema.parse(raw);
+    const clientPassword = (raw.settings as { clients: Array<{ password: string }> }).clients[0].password;
+    const link = genShadowsocksLink({
+      inbound,
+      address: '1.2.3.4',
+      port: 8388,
+      remark: 'generated-tls',
+      clientPassword,
+    });
+
+    const out = parseShadowsocksLink(link);
+    expect(out?.tag).toBe('generated-tls');
+    const settings = out?.settings as { servers: Array<{ address: string; port: number; method: string; password: string }> };
+    expect(settings.servers[0]).toEqual({
+      address: '1.2.3.4',
+      port: 8388,
+      method: '2022-blake3-aes-256-gcm',
+      password: 'ZmFrZS1zZXJ2ZXItcGFzc3dvcmQtMDAwMQ==:dGVzdC1jbGllbnQtcGFzc3dvcmQtMQ==',
+    });
+    const parsedStream = out?.streamSettings as Record<string, unknown>;
+    expect(parsedStream.network).toBe('tcp');
+    expect(parsedStream.security).toBe('tls');
+    expect(parsedStream.tlsSettings).toMatchObject({
+      serverName: 'edge.example.com',
+      alpn: ['h2', 'http/1.1'],
+      fingerprint: 'chrome',
+    });
+  });
+
+  it('normalizes the obfs-local HTTP plugin to a TCP HTTP header', () => {
+    const userinfo = Base64.encode('aes-256-gcm:secretpass', true);
+    const link = `ss://${userinfo}@1.2.3.4:8388/?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dexample.com#obfs-node`;
+    const out = parseShadowsocksLink(link);
+
+    expect(out?.tag).toBe('obfs-node');
+    const settings = out?.settings as { servers: Array<{ address: string; port: number; password: string }> };
+    expect(settings.servers[0]).toMatchObject({ address: '1.2.3.4', port: 8388, password: 'secretpass' });
+    expect(out?.streamSettings).toMatchObject({
+      network: 'tcp',
+      security: 'none',
+      tcpSettings: {
+        header: {
+          type: 'http',
+          request: { headers: { Host: ['example.com'] } },
+        },
+      },
+    });
+  });
+
+  it('parses emitted KCP mtu and tti settings', () => {
+    const userinfo = Base64.encode('aes-256-gcm:secretpass', true);
+    const out = parseShadowsocksLink(`ss://${userinfo}@1.2.3.4:8388?type=kcp&mtu=1400&tti=30#kcp-node`);
+
+    expect(out?.streamSettings).toMatchObject({
+      network: 'kcp',
+      kcpSettings: { mtu: 1400, tti: 30 },
+    });
+  });
+
+  it.each([
+    ['plain', ''],
+    ['unsupported', '?type=unsupported&security=unsupported'],
+    ['malformed', '?type=%zz'],
+  ])('uses safe stream defaults for a %s modern link', (_name, query) => {
+    const userinfo = Base64.encode('aes-256-gcm:secretpass', true);
+    const out = parseShadowsocksLink(`ss://${userinfo}@1.2.3.4:8388${query}#node`);
+    expect(out?.streamSettings).toEqual({
+      network: 'tcp',
+      security: 'none',
+      tcpSettings: { header: { type: 'none' } },
+    });
+  });
+
   it('parses the modern userinfo@host:port form', () => {
     // ss://base64(method:password)@host:port#remark
     const userinfo = Base64.encode('2022-blake3-aes-128-gcm:supersecret');
@@ -249,6 +334,15 @@ describe('parseShadowsocksLink', () => {
     expect(settings.servers[0].port).toBe(1080);
     expect(settings.servers[0].method).toBe('aes-256-gcm');
     expect(settings.servers[0].password).toBe('legacypw');
+    expect(out?.streamSettings).toBeUndefined();
+  });
+
+  it('does not treat query-like text inside legacy base64 as transport settings', () => {
+    const inner = Base64.encode('aes-256-gcm:legacy?type=ws@10.0.0.1:1080');
+    const out = parseShadowsocksLink(`ss://${inner}#imported-legacy`);
+    const settings = out?.settings as { servers: Array<{ password: string }> };
+    expect(settings.servers[0].password).toBe('legacy?type=ws');
+    expect(out?.streamSettings).toBeUndefined();
   });
 
   it('decodes URL-safe base64 userinfo (as the emitter writes it)', () => {

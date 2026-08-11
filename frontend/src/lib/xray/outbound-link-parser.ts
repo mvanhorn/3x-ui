@@ -168,6 +168,14 @@ function applyTransportParams(stream: Raw, params: URLSearchParams): void {
   const host = params.get('host') ?? '';
   const path = params.get('path') ?? '/';
   switch (network) {
+    case 'kcp': {
+      const kcp = stream.kcpSettings as Raw;
+      const mtu = Number(params.get('mtu'));
+      const tti = Number(params.get('tti'));
+      if (Number.isFinite(mtu) && mtu > 0) kcp.mtu = mtu;
+      if (Number.isFinite(tti) && tti > 0) kcp.tti = tti;
+      break;
+    }
     case 'ws':
       (stream.wsSettings as Raw).host = host;
       (stream.wsSettings as Raw).path = path;
@@ -439,6 +447,38 @@ export function parseTrojanLink(link: string): Raw | null {
   };
 }
 
+function applyShadowsocksPlugin(params: URLSearchParams): void {
+  const [name, ...rawOptions] = (params.get('plugin') ?? '').split(';');
+  if (name !== 'obfs-local') return;
+  const options = new Map<string, string>();
+  for (const rawOption of rawOptions) {
+    const separator = rawOption.indexOf('=');
+    if (separator >= 0) options.set(rawOption.slice(0, separator), rawOption.slice(separator + 1));
+  }
+  if (options.get('obfs') !== 'http') return;
+  params.set('type', 'tcp');
+  params.set('headerType', 'http');
+  params.set('host', options.get('obfs-host') ?? '');
+}
+
+function supportedShadowsocksNetwork(network: string | null): string {
+  switch (network) {
+    case 'tcp':
+    case 'kcp':
+    case 'ws':
+    case 'grpc':
+    case 'httpupgrade':
+    case 'xhttp':
+      return network;
+    default:
+      return 'tcp';
+  }
+}
+
+function supportedShadowsocksSecurity(security: string | null): string {
+  return security === 'tls' || security === 'reality' ? security : 'none';
+}
+
 export function parseShadowsocksLink(link: string): Raw | null {
   if (!link.startsWith('ss://')) return null;
   // Two link shapes coexist:
@@ -448,6 +488,7 @@ export function parseShadowsocksLink(link: string): Raw | null {
   let userInfo: string;
   let host: string;
   let port: number;
+  let streamSettings: Raw | undefined;
   let remark = '';
   const hashIndex = link.indexOf('#');
   const linkNoHash = hashIndex >= 0 ? link.slice(0, hashIndex) : link;
@@ -456,6 +497,7 @@ export function parseShadowsocksLink(link: string): Raw | null {
   }
   const queryIndex = linkNoHash.indexOf('?');
   const core = queryIndex >= 0 ? linkNoHash.slice(0, queryIndex) : linkNoHash;
+  const params = new URLSearchParams(queryIndex >= 0 ? linkNoHash.slice(queryIndex + 1) : '');
   const atIndex = core.indexOf('@');
   if (atIndex >= 0) {
     const rawUserInfo = core.slice('ss://'.length, atIndex);
@@ -467,11 +509,18 @@ export function parseShadowsocksLink(link: string): Raw | null {
       try { userInfo = Base64.decode(rawUserInfo); }
       catch { userInfo = rawUserInfo; }
     }
-    const hostPort = core.slice(atIndex + 1);
+    const hostPort = core.slice(atIndex + 1).replace(/\/$/, '');
     const colon = hostPort.lastIndexOf(':');
     if (colon < 0) return null;
     host = hostPort.slice(0, colon);
     port = Number(hostPort.slice(colon + 1)) || 443;
+    applyShadowsocksPlugin(params);
+    const network = supportedShadowsocksNetwork(params.get('type'));
+    const security = supportedShadowsocksSecurity(params.get('security'));
+    streamSettings = buildStream(network, security);
+    applyTransportParams(streamSettings, params);
+    applySecurityParams(streamSettings, params);
+    applyFinalMaskParam(streamSettings, params);
   } else {
     let decoded: string;
     try { decoded = Base64.decode(core.slice('ss://'.length)); }
@@ -494,6 +543,7 @@ export function parseShadowsocksLink(link: string): Raw | null {
     settings: {
       servers: [{ address: host, port, password, method }],
     },
+    ...(streamSettings ? { streamSettings } : {}),
   };
 }
 

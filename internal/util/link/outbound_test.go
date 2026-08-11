@@ -208,6 +208,128 @@ func TestParseShadowsocks(t *testing.T) {
 	}
 }
 
+func TestParseShadowsocksTransportSettings(t *testing.T) {
+	user := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:secretpass"))
+	link := "ss://" + user + "@1.2.3.4:8388?type=tcp&security=tls&sni=example.com&alpn=h2%2Chttp%2F1.1&fp=chrome&vcn=verify.example.com#node"
+	res, err := ParseLink(link)
+	if err != nil {
+		t.Fatalf("parse ss transport settings: %v", err)
+	}
+	if res.Identity != "ss:aes-256-gcm:secretpass@1.2.3.4:8388" {
+		t.Errorf("identity = %q, want query-free identity", res.Identity)
+	}
+	stream, ok := res.Outbound["streamSettings"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing streamSettings: %v", res.Outbound)
+	}
+	if stream["network"] != "tcp" || stream["security"] != "tls" {
+		t.Errorf("stream transport = %v/%v, want tcp/tls", stream["network"], stream["security"])
+	}
+	tls := stream["tlsSettings"].(map[string]any)
+	if tls["serverName"] != "example.com" {
+		t.Errorf("serverName = %v, want example.com", tls["serverName"])
+	}
+	if tls["fingerprint"] != "chrome" {
+		t.Errorf("fingerprint = %v, want chrome", tls["fingerprint"])
+	}
+	if tls["verifyPeerCertByName"] != "verify.example.com" {
+		t.Errorf("verifyPeerCertByName = %v, want verify.example.com", tls["verifyPeerCertByName"])
+	}
+	if got := tls["alpn"]; !equalStringSlices(got, []string{"h2", "http/1.1"}) {
+		t.Errorf("alpn = %v, want [h2 http/1.1]", got)
+	}
+}
+
+func TestParseShadowsocksKCPSettings(t *testing.T) {
+	user := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:secretpass"))
+	res, err := ParseLink("ss://" + user + "@1.2.3.4:8388?type=kcp&mtu=1400&tti=30#node")
+	if err != nil {
+		t.Fatalf("parse ss kcp settings: %v", err)
+	}
+	kcp := res.Outbound["streamSettings"].(map[string]any)["kcpSettings"].(map[string]any)
+	if kcp["mtu"] != 1400 || kcp["tti"] != 30 {
+		t.Errorf("kcp settings = mtu %v, tti %v; want 1400, 30", kcp["mtu"], kcp["tti"])
+	}
+}
+
+func TestParseShadowsocksObfsHTTPPlugin(t *testing.T) {
+	user := base64.RawURLEncoding.EncodeToString([]byte("aes-128-gcm:secretpass"))
+	link := "ss://" + user + "@1.2.3.4:8388/?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dexample.com#node"
+	res, err := ParseLink(link)
+	if err != nil {
+		t.Fatalf("parse ss obfs plugin: %v", err)
+	}
+	if res.Outbound["tag"] != "node" {
+		t.Errorf("tag = %v, want node", res.Outbound["tag"])
+	}
+	server := res.Outbound["settings"].(map[string]any)["servers"].([]any)[0].(map[string]any)
+	if server["address"] != "1.2.3.4" || server["port"] != 8388 || server["password"] != "secretpass" {
+		t.Errorf("server changed while applying plugin: %v", server)
+	}
+	stream := res.Outbound["streamSettings"].(map[string]any)
+	header := stream["tcpSettings"].(map[string]any)["header"].(map[string]any)
+	if header["type"] != "http" {
+		t.Fatalf("header type = %v, want http", header["type"])
+	}
+	request := header["request"].(map[string]any)
+	hosts := request["headers"].(map[string]any)["Host"]
+	if !equalStringSlices(hosts, []string{"example.com"}) {
+		t.Errorf("Host = %v, want [example.com]", hosts)
+	}
+}
+
+func TestParseShadowsocksStreamDefaults(t *testing.T) {
+	user := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:secretpass"))
+	for name, query := range map[string]string{
+		"plain":              "",
+		"unsupported":        "?type=unsupported&security=unsupported",
+		"malformed encoding": "?type=%zz",
+	} {
+		t.Run(name, func(t *testing.T) {
+			res, err := ParseLink("ss://" + user + "@1.2.3.4:8388" + query + "#node")
+			if err != nil {
+				t.Fatalf("parse ss: %v", err)
+			}
+			stream := res.Outbound["streamSettings"].(map[string]any)
+			if stream["network"] != "tcp" || stream["security"] != "none" {
+				t.Errorf("stream defaults = %v/%v, want tcp/none", stream["network"], stream["security"])
+			}
+			header := stream["tcpSettings"].(map[string]any)["header"].(map[string]any)
+			if header["type"] != "none" {
+				t.Errorf("header type = %v, want none", header["type"])
+			}
+		})
+	}
+}
+
+func TestParseShadowsocksLegacyStaysQueryFree(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:secret?type=ws@1.2.3.4:8388"))
+	res, err := ParseLink("ss://" + body + "#legacy")
+	if err != nil {
+		t.Fatalf("parse legacy ss: %v", err)
+	}
+	server := res.Outbound["settings"].(map[string]any)["servers"].([]any)[0].(map[string]any)
+	if server["password"] != "secret?type=ws" {
+		t.Errorf("password = %v, want encoded query-like text intact", server["password"])
+	}
+	if _, ok := res.Outbound["streamSettings"]; ok {
+		t.Errorf("legacy link unexpectedly gained streamSettings: %v", res.Outbound["streamSettings"])
+	}
+}
+
+func equalStringSlices(got any, want []string) bool {
+	values, ok := got.([]string)
+	if !ok || len(values) != len(want) {
+		return false
+	}
+	for i := range values {
+		if values[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestParseShadowsocksBadPort(t *testing.T) {
 	user := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:secretpass"))
 	cases := map[string]string{
